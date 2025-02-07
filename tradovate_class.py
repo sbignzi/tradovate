@@ -43,6 +43,8 @@ class TradovateAPI:
         self.subscriptionToGetLiveChart = None
         self.subscriptionToGetQuotes = None
         self.provider = "tradovate"
+        self.start_time = None
+        self.historical_chart_data_saved = False
 
     def authenticate(self):
         """Authenticate and get access token"""
@@ -60,9 +62,142 @@ class TradovateAPI:
         response = requests.post(auth_url, json=payload, headers=headers)
         response.raise_for_status()  # Check for errors
         response_data = response.json()
-        # print(f"Authentication Response: {response_data}")  # Debugging the response
         self.token = response_data.get("mdAccessToken")
         print(f"Access Token: {self.token}")
+
+    def save_bar_data(self, ws, payload):
+        timestamp_date = None
+        # Handle quotes
+        if "quotes" in payload[0].get("d", {}):
+            for quote in payload[0]["d"]["quotes"]:
+                timestamp = quote.get("timestamp")
+                opening_price = (
+                    quote.get("entries", {}).get("OpeningPrice", {}).get("price")
+                )
+                high_price = quote.get("entries", {}).get("HighPrice", {}).get("price")
+                low_price = quote.get("entries", {}).get("LowPrice", {}).get("price")
+                close_price = quote.get("entries", {}).get("Trade", {}).get("price")
+
+                # bid_price = quote["entries"]["Bid"]["price"]
+                bid_price = quote.get("entries", {}).get("Bid", {}).get("price")
+                ask_price = quote.get("entries", {}).get("Offer", {}).get("price")
+
+                # Convert timestamp to datetime format
+                timestamp_dt = datetime.fromisoformat(
+                    timestamp.replace("Z", "+00:00")
+                ).strftime("%Y-%m-%d %H:%M:%S")
+
+                row = {
+                    "date": timestamp_dt,
+                    "open": opening_price,
+                    "high": high_price,
+                    "low": low_price,
+                    "close": close_price,
+                    "ask": ask_price,
+                    "bid": bid_price,
+                }
+
+                # Save the extracted data to CSV
+                self.save_to_csv(self.quote_file, row)
+
+        # Handle charts
+        # Extract the date part from self.start_time (which is a string)
+        if self.start_time:
+            start_date = datetime.strptime(self.start_time[:10], "%Y-%m-%d").date()
+
+        if "charts" in payload[0].get("d", {}):
+            for chart in payload[0]["d"]["charts"]:
+                subscriptionId = chart["id"]
+                for bar in chart.get("bars", []):
+                    timestamp = bar.get("timestamp")
+                    open_price = bar.get("open")
+                    high_price = bar.get("high")
+                    low_price = bar.get("low")
+                    close_price = bar.get("close")
+
+                    timestamp_dt = datetime.fromisoformat(
+                        timestamp.replace("Z", "+00:00")
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+
+                    row = {
+                        "date": timestamp_dt,
+                        "open": open_price,
+                        "high": high_price,
+                        "low": low_price,
+                        "close": close_price,
+                    }
+
+                    self.save_to_csv(self.chart_file, row)
+
+                    try:
+                        # Convert timestamp (ISO format) to datetime and extract only the date
+                        timestamp_date = datetime.strptime(
+                            timestamp[:10], "%Y-%m-%d"
+                        ).date()  # Extracts only YYYY-MM-DD
+
+                    except:
+                        pass
+
+                    # Compare only the date part
+                    if self.historical_chart_data_saved == False:
+                        if self.subscriptionToGetHistoricalChart:
+                            if timestamp_date == start_date and not self.check_timing:
+                                self.check_timing = True
+                            if self.check_timing == True:
+                                if timestamp_dt >= historical_data_stop_date_time:
+                                    print(
+                                        f"Historical data retrived (getChart historical data)."
+                                    )
+                                    # # Example usage
+                                    input_csv = self.chart_file  # Your input file
+                                    output_csv = (
+                                        self.sorted_chart_file
+                                    )  # Your desired output file with sorted data
+
+                                    self.reorder_csv_by_timestamp(input_csv, output_csv)
+                                    subscription_message = {
+                                        "subscriptionId": subscriptionId
+                                    }
+                                    ws.send(
+                                        f"md/cancelChart\n5\n\n{json.dumps(subscription_message)}"
+                                    )
+                                    print("Data received, cancelChart.")
+                                    # self.check_timing = False
+                                    self.historical_chart_data_saved = True
+                                    break
+
+    def save_to_csv(self, output_file, data_dict):
+        """Append the extracted data (as a dictionary) to the CSV file with dynamic headers."""
+        current_datetime = datetime.utcnow()
+        year = current_datetime.year
+        month = current_datetime.month
+        day = current_datetime.day
+        filename = f"{self.symbol}_{year}-{month}-{day}"
+
+        output_file = f"data/{self.provider}/{output_file}/{self.symbol}/{year}/{month}/{filename}.csv"
+        # Ensure the folder exists
+
+        output_folder = os.path.dirname(output_file)
+        if output_folder and not os.path.exists(output_folder):
+            os.makedirs(output_folder)  # Create folder if missing
+            print(f"Created missing folder: {output_folder}")
+
+        # Extract headers dynamically from dictionary keys
+        headers = list(data_dict.keys())
+
+        # Check if file exists
+        file_exists = os.path.exists(output_file)
+
+        # Open file and write data
+        with open(output_file, mode="a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+
+            # If the file is new, write the header first
+            if not file_exists:
+                writer.writeheader()
+
+            # Write the dictionary as a row
+            writer.writerow(data_dict)
 
     # Function to reorder the CSV by the Timestamp
     def reorder_csv_by_timestamp(self, input_file, output_file):
@@ -110,10 +245,6 @@ class TradovateAPI:
     def reorder_csv_by_timestamp(self, input_file, output_file):
         """Reads, sorts, and removes duplicate rows from a CSV file based on the timestamp."""
 
-        # Ensure the folder exists
-        # input_folder = os.path.dirname(input_file)
-        # output_folder = os.path.dirname(output_file)
-
         current_datetime = datetime.utcnow()
         year = current_datetime.year
         month = current_datetime.month
@@ -125,30 +256,15 @@ class TradovateAPI:
         output_file = f"data/{self.provider}/{output_file}/{self.symbol}/{year}/{month}/{filename}.csv"
 
         output_folder = os.path.dirname(output_file)
-        input_folder = os.path.dirname(input_file)
 
-        print("input_file, output_folder", input_file, output_folder)
-        # if output_folder and not os.path.exists(output_folder):
-        #     os.makedirs(output_folder)  # Create folder if missing
-        #     print(f"Created missing folder: {output_folder}")
-
-        if input_folder and not os.path.exists(input_folder):
-            os.makedirs(input_folder)
-            print(f"Created missing folder: {input_folder}")
+        # Check if input file exists
+        if not os.path.exists(input_file):
+            print(f"Error: {input_file} does not exist. Skipping processing.")
+            return  # Exit the function early
 
         if output_folder and not os.path.exists(output_folder):
             os.makedirs(output_folder)
             print(f"Created missing folder: {output_folder}")
-
-        # Ensure the input file exists, otherwise create it with headers
-        if not os.path.exists(input_file):
-            print(f"{input_file} not found. Creating a new file...")
-            with open(input_file, mode="w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(
-                    ["date", "open", "high", "low", "close"]
-                )  # Default headers
-            return  # Exit function as no data to sort yet
 
         # Read the CSV file and store all rows in a list
         unique_rows = {}  # Use a dictionary to remove duplicates while keeping order
@@ -173,7 +289,7 @@ class TradovateAPI:
             writer.writerow(header)  # Write the header
             writer.writerows(sorted_rows)  # Write sorted and unique rows
 
-        print(f"CSV sorted and duplicates removed. Saved to {output_file}")
+        print(f"Historical chart data saved")
 
     def get_last_5min_bar_time():
         """Calculate the last 5-minute bar timestamp before the current UTC time."""
@@ -203,42 +319,9 @@ class TradovateAPI:
     # Set the desired time to the end of the first day
     global historical_data_stop_date_time
     historical_data_stop_date_time = get_end_of_first_day()
-    print(
-        f"Desired time for the end of the first trading day: {historical_data_stop_date_time}"
-    )
-
-    def save_to_csv(self, output_file, data_dict):
-        """Append the extracted data (as a dictionary) to the CSV file with dynamic headers."""
-        current_datetime = datetime.utcnow()
-        year = current_datetime.year
-        month = current_datetime.month
-        day = current_datetime.day
-        filename = f"{self.symbol}_{year}-{month}-{day}"
-
-        output_file = f"data/{self.provider}/{output_file}/{self.symbol}/{year}/{month}/{filename}.csv"
-        # Ensure the folder exists
-
-        output_folder = os.path.dirname(output_file)
-        if output_folder and not os.path.exists(output_folder):
-            os.makedirs(output_folder)  # Create folder if missing
-            print(f"Created missing folder: {output_folder}")
-
-        # Extract headers dynamically from dictionary keys
-        headers = list(data_dict.keys())
-
-        # Check if file exists
-        file_exists = os.path.exists(output_file)
-
-        # Open file and write data
-        with open(output_file, mode="a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=headers)
-
-            # If the file is new, write the header first
-            if not file_exists:
-                writer.writeheader()
-
-            # Write the dictionary as a row
-            writer.writerow(data_dict)
+    # print(
+    #     f"Desired time for the end of the first trading day: {historical_data_stop_date_time}"
+    # )
 
     def send_heartbeat(self, ws):
         # Only send a heartbeat if it's been 10 seconds since the last one
@@ -304,7 +387,7 @@ class TradovateAPI:
         print("WebSocket connected.")
 
         auth_message = f"authorize\n2\n\n{self.token}"
-        print(f"==> '{auth_message}'")
+        # print(f"==> '{auth_message}'")
         ws.send(auth_message)
         print("requesting data ...")
 
@@ -342,7 +425,7 @@ class TradovateAPI:
             },
         }
         self.subscriptionToGetHistoricalChart = True
-        print(f"Subscribing to chart data: {json.dumps(chart_subscription_message)}")
+        print(f"Subscribing to historical chart data ...")
         ws.send(f"md/getChart\n4\n\n{json.dumps(chart_subscription_message)}")
 
     def get_live_chart(self, ws):
@@ -364,13 +447,13 @@ class TradovateAPI:
             },
         }
         self.subscriptionToGetLiveChart = True
-        print(f"Subscribing to chart data: {json.dumps(chart_subscription_message)}")
+        print(f"Subscribing to live chart data ...")
         ws.send(f"md/getChart\n6\n\n{json.dumps(chart_subscription_message)}")
 
     def get_quotes(self, ws):
         subscription_message = {"symbol": self.symbol}
         self.subscriptionToGetQuotes = True
-        print(f"Subscribing to quote data: {json.dumps(subscription_message)}")
+        print(f"Subscribing to quote data ...")
         ws.send(f"md/subscribeQuote\n4\n\n{json.dumps(subscription_message)}")
 
     def run_websocket(self):
@@ -382,107 +465,6 @@ class TradovateAPI:
             on_open=self.on_open,
         )
         ws.run_forever(ping_interval=60, ping_timeout=30)
-
-    def save_bar_data(self, ws, payload):
-
-        timestamp_date = None
-        # Handle quotes
-        if "quotes" in payload[0].get("d", {}):
-            for quote in payload[0]["d"]["quotes"]:
-                timestamp = quote.get("timestamp")
-                opening_price = (
-                    quote.get("entries", {}).get("OpeningPrice", {}).get("price")
-                )
-                high_price = quote.get("entries", {}).get("HighPrice", {}).get("price")
-                low_price = quote.get("entries", {}).get("LowPrice", {}).get("price")
-                close_price = quote.get("entries", {}).get("Trade", {}).get("price")
-
-                # bid_price = quote["entries"]["Bid"]["price"]
-                bid_price = quote.get("entries", {}).get("Bid", {}).get("price")
-                ask_price = quote.get("entries", {}).get("Offer", {}).get("price")
-
-                # Convert timestamp to datetime format
-                timestamp_dt = datetime.fromisoformat(
-                    timestamp.replace("Z", "+00:00")
-                ).strftime("%Y-%m-%d %H:%M:%S")
-
-                row = {
-                    "date": timestamp_dt,
-                    "open": opening_price,
-                    "high": high_price,
-                    "low": low_price,
-                    "close": close_price,
-                    "ask": ask_price,
-                    "bid": bid_price,
-                }
-
-                # Save the extracted data to CSV
-                self.save_to_csv(self.quote_file, row)
-
-        # Handle charts
-        if "charts" in payload[0].get("d", {}):
-            for chart in payload[0]["d"]["charts"]:
-                subscriptionId = chart["id"]
-                for bar in chart.get("bars", []):
-                    timestamp = bar.get("timestamp")
-                    open_price = bar.get("open")
-                    high_price = bar.get("high")
-                    low_price = bar.get("low")
-                    close_price = bar.get("close")
-
-                    timestamp_dt = datetime.fromisoformat(
-                        timestamp.replace("Z", "+00:00")
-                    ).strftime("%Y-%m-%d %H:%M:%S")
-
-                    row = {
-                        "date": timestamp_dt,
-                        "open": open_price,
-                        "high": high_price,
-                        "low": low_price,
-                        "close": close_price,
-                    }
-
-                    self.save_to_csv(self.chart_file, row)
-
-                    try:
-                        # Convert timestamp (ISO format) to datetime and extract only the date
-                        timestamp_date = datetime.strptime(
-                            timestamp[:10], "%Y-%m-%d"
-                        ).date()  # Extracts only YYYY-MM-DD
-
-                        # Extract the date part from self.start_time (which is a string)
-                        start_date = datetime.strptime(
-                            self.start_time[:10], "%Y-%m-%d"
-                        ).date()
-                    except:
-                        pass
-
-                    # Compare only the date part
-                    if self.subscriptionToGetHistoricalChart and timestamp_date:
-                        print(timestamp_date, start_date)
-                        if timestamp_date == start_date:
-                            self.check_timing = True
-                            print(f"First day dateTime: {timestamp_date}")
-                        if self.check_timing == True:
-                            if timestamp_dt >= historical_data_stop_date_time:
-                                print(
-                                    f"Historical data stop dateTime: {historical_data_stop_date_time} reached (getChart historical data)."
-                                )
-                                # # Example usage
-                                input_csv = self.chart_file  # Your input file
-                                output_csv = (
-                                    self.sorted_chart_file
-                                )  # Your desired output file with sorted data
-
-                                self.reorder_csv_by_timestamp(input_csv, output_csv)
-                                subscription_message = {
-                                    "subscriptionId": subscriptionId
-                                }
-                                ws.send(
-                                    f"md/cancelChart\n5\n\n{json.dumps(subscription_message)}"
-                                )
-                                print("Data received, cancelChart.")
-                                break
 
 
 def authenticate_and_subscribe():
